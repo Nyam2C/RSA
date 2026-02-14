@@ -1,0 +1,6 @@
+# RSA 실행 결과물
+rsa_output/*/
+
+# Python
+__pycache__/
+*.pyc

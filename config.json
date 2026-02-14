@@ -1,0 +1,13 @@
+{
+    "N": 5,
+    "K": 3,
+    "T": 3,
+    "final_mode": "random",
+    "model": "opus",
+    "aggregation_model": "opus",
+    "claude_path": "claude",
+    "disable_tools": true,
+    "output_dir": "./rsa_output",
+    "save_intermediate": true,
+    "verbose": true
+}

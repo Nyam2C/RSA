@@ -144,6 +144,10 @@ class RSA:
         cmd = [
             self.claude_path, "-p",
             "--output-format", "json",
+            "--session-id", "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}".format(
+                random.getrandbits(32), random.getrandbits(16),
+                random.getrandbits(16), random.getrandbits(16),
+                random.getrandbits(48)),
             "--no-session-persistence",
             "--model", model,
         ]

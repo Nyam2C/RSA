@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     "claude_path": "claude",      # CLI 실행 경로
     "max_budget_usd": None,       # 최대 비용 제한 (None=무제한)
     "disable_tools": True,        # 도구 비활성화 (계획/분석만 생성)
-    "timeout": 600,               # CLI 호출 타임아웃 (초)
+    "timeout": 1800,              # CLI 호출 타임아웃 (초, 30분)
 
     # 출력 설정
     "output_dir": "./rsa_output",

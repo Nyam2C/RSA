@@ -213,6 +213,7 @@ python rsa.py --help
 - **최종 선택**: 논문 Algorithm 1 step 4의 uniform random sampling이 기본. `--final-mode aggregate`로 전체 종합도 가능
 - **도구 비활성화**: `--allowedTools ""`로 Claude Code의 모든 도구(Bash, Edit 등)를 비활성화하여 텍스트 생성만 수행
 - **시스템 프롬프트**: 계획/분석 전문가로 역할 제한
+- **순차 실행**: CLI 병렬 호출 시 권한 충돌로 품질 저하가 발생하여 순차 실행 방식 채택
 - **stdin 프롬프트**: aggregation 프롬프트가 수만 자에 달할 수 있어 stdin으로 전달
 - **중첩 방지**: `CLAUDECODE` 환경변수를 제거하여 Claude Code 내부 실행 시 중첩 에러 방지
 - **비용 추적**: 각 CLI 호출의 비용을 누적 추적하여 SUMMARY.md에 기록

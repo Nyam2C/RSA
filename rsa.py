@@ -220,58 +220,18 @@ class RSA:
     def call_llm_batch(
         self, prompts: List[str], model: Optional[str] = None
     ) -> List[str]:
-        """여러 프롬프트를 병렬로 실행 (Popen)"""
-        cmd = self._build_cmd(model)
+        """여러 프롬프트를 순차 실행 (권한 충돌 방지)"""
         n = len(prompts)
-        self.log("  병렬 실행 시작: {}개".format(n))
+        self.log("  순차 실행 시작: {}개".format(n))
 
-        # 모든 프로세스를 동시에 시작 + stdin 즉시 전달
-        procs = []
-        for prompt in prompts:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=self.env,
-            )
-            # stdin에 프롬프트를 쓰고 닫아서 프로세스가 즉시 작업 시작
-            proc.stdin.write(prompt.encode("utf-8"))
-            proc.stdin.close()
-            proc.stdin = None  # communicate()가 flush 시도하지 않도록
-            procs.append((proc, prompt))
-
-        # 결과 수집 (timeout 개별 적용)
         results = []
-        for i, (proc, prompt) in enumerate(procs):
-            try:
-                timeout = self.config.get("timeout", 600)
-                stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
-                stdout = stdout_bytes.decode("utf-8", errors="replace")
-                stderr = stderr_bytes.decode("utf-8", errors="replace")
-
-                if proc.returncode != 0:
-                    self.log("  [{}/{}] CLI 오류: {}".format(
-                        i + 1, n, stderr.strip()[:200]))
-                    # 실패 시 순차 재시도
-                    results.append(self.call_llm(prompt, model))
-                    continue
-
-                text = self._parse_response(stdout)
-                # 결과 미리보기 (첫 3줄)
-                preview_lines = text.strip().splitlines()[:3]
-                preview = "\n".join("    │ " + l for l in preview_lines)
-                self.log("  [{}/{}] 완료\n{}".format(i + 1, n, preview))
-                results.append(text)
-
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
-                self.log("  [{}/{}] 타임아웃 → 순차 재시도".format(i + 1, n))
-                results.append(self.call_llm(prompt, model))
-            except (json.JSONDecodeError, RuntimeError) as e:
-                self.log("  [{}/{}] 오류: {} → 순차 재시도".format(i + 1, n, e))
-                results.append(self.call_llm(prompt, model))
+        for i, prompt in enumerate(prompts):
+            self.log("  [{}/{}] 실행 중...".format(i + 1, n))
+            text = self.call_llm(prompt, model)
+            preview_lines = text.strip().splitlines()[:3]
+            preview = "\n".join("    │ " + l for l in preview_lines)
+            self.log("  [{}/{}] 완료\n{}".format(i + 1, n, preview))
+            results.append(text)
 
         return results
 
@@ -291,10 +251,10 @@ class RSA:
 
     # ----- Step 1: 초기 Population 생성 -----
     def generate_initial_population(self, task: str) -> List[str]:
-        """N개의 독립적인 초기 솔루션 병렬 생성"""
+        """N개의 독립적인 초기 솔루션 순차 생성"""
         N = self.config["N"]
         self.log("\n{}".format("=" * 60))
-        self.log("Step 1: 초기 population 병렬 생성 (N={})".format(N))
+        self.log("Step 1: 초기 population 순차 생성 (N={})".format(N))
         self.log("{}".format("=" * 60))
 
         prompts = []

@@ -1,6 +1,6 @@
 # RSA (Recursive Self-Aggregation) for Claude Code
 
-논문 ["Recursive Self-Aggregation Unlocks Deep Thinking in Large Language Models"](https://arxiv.org/abs/2507.xxxxx)의
+논문 ["Recursive Self-Aggregation Unlocks Deep Thinking in Large Language Models"](https://arxiv.org/abs/2509.26626)의
 Algorithm 1 (Appendix B)을 Claude Code CLI 환경에서 바로 사용할 수 있도록 구현한 스크립트입니다.
 
 ## 핵심 원리

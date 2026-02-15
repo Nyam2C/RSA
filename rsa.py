@@ -19,7 +19,6 @@ import argparse
 import time
 import subprocess
 import shutil
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
@@ -46,7 +45,7 @@ DEFAULT_CONFIG = {
     "max_budget_usd": None,       # 최대 비용 제한 (None=무제한)
     "disable_tools": True,        # 도구 비활성화 (계획/분석만 생성)
     "timeout": 1800,              # CLI 호출 타임아웃 (초, 30분)
-    "max_workers": 2,             # 병렬 실행 워커 수
+    "max_workers": 4,             # 병렬 실행 워커 수
 
     # 출력 설정
     "output_dir": "./rsa_output",
@@ -119,10 +118,6 @@ class RSA:
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith("CLAUDECODE")}
 
-        # 비용 추적
-        self.total_cost_usd = 0.0
-        self._cost_lock = threading.Lock()
-
         self.output_dir = Path(self.config["output_dir"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -159,8 +154,11 @@ class RSA:
             cmd.extend(["--allowedTools", ""])
         cmd.extend([
             "--system-prompt",
-            "당신은 계획 수립 전문가입니다. 분석과 계획만 텍스트로 작성하세요. "
-            "코드를 실행하거나 파일을 수정하지 마세요."
+            "당신은 계획 수립 전문가입니다. "
+            "반드시 이 메시지 하나에 완전한 솔루션 전체를 텍스트로 직접 작성하세요. "
+            "도구를 사용하지 마세요. 파일을 읽거나 쓰지 마세요. "
+            "코드를 실행하지 마세요. 승인을 요청하지 마세요. "
+            "응답 자체가 최종 결과물이어야 합니다."
         ])
         if self.config.get("max_budget_usd"):
             cmd.extend(["--max-turns-budget",
@@ -168,17 +166,15 @@ class RSA:
         return cmd
 
     def _parse_response(self, stdout: str) -> str:
-        """CLI JSON 응답 파싱 및 비용 추적"""
+        """CLI JSON 응답 파싱"""
         response = json.loads(stdout)
         if response.get("is_error"):
             raise RuntimeError(
                 "CLI 응답 오류: {}".format(response.get("result", "unknown")))
-        cost = response.get("cost_usd") or response.get("total_cost_usd", 0)
-        with self._cost_lock:
-            self.total_cost_usd += cost
-            cumulative = self.total_cost_usd
-        self.log("    비용: ${:.4f} (누적: ${:.4f})".format(
-            cost, cumulative))
+        if "result" not in response:
+            raise RuntimeError(
+                "CLI 응답에 result 없음: {}".format(
+                    json.dumps(response, ensure_ascii=False)[:500]))
         return response["result"]
 
     def call_llm(self, prompt: str, model: Optional[str] = None) -> str:
@@ -195,6 +191,7 @@ class RSA:
                     stderr=subprocess.PIPE,
                     universal_newlines=True,
                     env=self.env,
+                    cwd="/tmp",
                     timeout=self.config.get("timeout", 600),
                 )
                 if result.returncode != 0:
@@ -328,6 +325,77 @@ class RSA:
 
         return self.call_llm_batch(prompts, model=self.config["aggregation_model"])
 
+    # ----- Step 0: 코드베이스 사전 분석 -----
+    def analyze_project(self, task: str, project_dir: str) -> str:
+        """프로젝트 디렉토리를 분석하여 task에 컨텍스트를 추가"""
+        self.log(f"\n{'='*60}")
+        self.log(f"Step 0: 코드베이스 사전 분석 ({project_dir})")
+        self.log(f"{'='*60}")
+
+        analyze_prompt = (
+            "다음 프로젝트 디렉토리를 분석하세요: {}\n\n"
+            "분석할 내용:\n"
+            "1. 디렉토리 구조와 주요 파일 목록\n"
+            "2. 사용 기술 스택 (언어, 프레임워크, 라이브러리, 의존성)\n"
+            "3. 설정 파일 내용 (환경변수, 빌드, 배포 설정 등)\n"
+            "4. 주요 모듈/클래스/함수의 역할과 관계\n"
+            "5. 외부 API/서비스 연동 현황\n"
+            "6. 데이터 흐름과 아키텍처 패턴\n\n"
+            "최대한 구체적으로 실제 코드와 설정을 인용하여 분석하세요."
+        ).format(project_dir)
+
+        # 분석용 CLI: 읽기 도구 허용, 프로젝트 디렉토리에서 실행
+        model = self.config.get("model", "opus")
+        cmd = [
+            self.claude_path, "-p",
+            "--output-format", "json",
+            "--session-id", "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}".format(
+                random.getrandbits(32), random.getrandbits(16),
+                random.getrandbits(16), random.getrandbits(16),
+                random.getrandbits(48)),
+            "--no-session-persistence",
+            "--model", model,
+            "--system-prompt",
+            "당신은 코드베이스 분석 전문가입니다. "
+            "프로젝트의 파일을 읽고 구조를 파악하여 상세한 분석 보고서를 작성하세요. "
+            "실제 코드와 설정 내용을 인용하세요. 파일을 수정하지 마세요."
+        ]
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=analyze_prompt,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    env=self.env,
+                    cwd=project_dir,
+                    timeout=self.config.get("timeout", 1800),
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "분석 CLI 오류 (exit {}): {}".format(
+                            result.returncode, result.stderr.strip()))
+                analysis = self._parse_response(result.stdout)
+                self.log(f"  분석 완료: {len(analysis)}자")
+
+                # 분석 결과 저장
+                analysis_path = self.run_dir / "project_analysis.md"
+                analysis_path.write_text(analysis, encoding="utf-8")
+
+                return analysis
+
+            except Exception as e:
+                self.log(f"  분석 오류: {e}")
+                if attempt == max_retries - 1:
+                    self.log("  분석 실패, 원본 task로 진행합니다.")
+                    return ""
+                time.sleep(5)
+
+        return ""
+
     # ----- 메인 실행 -----
     def run(self, task: str) -> str:
         """RSA 전체 파이프라인 실행"""
@@ -337,7 +405,7 @@ class RSA:
 
         self.log(f"\n{'#'*60}")
         self.log(f"RSA 실행 시작")
-        W = self.config.get("max_workers", 2)
+        W = self.config.get("max_workers", 4)
         self.log(f"  N={N} (population), K={K} (subset), T={T} (rounds), workers={W}")
         self.log(f"  모델: {self.config['model']}")
         self.log(f"  종합 모델: {self.config['aggregation_model']}")
@@ -351,9 +419,24 @@ class RSA:
             encoding="utf-8"
         )
 
-        # 작업 저장
+        # Step 0: 코드베이스 사전 분석
+        project_dir = self.config.get("project_dir")
+        if project_dir:
+            analysis = self.analyze_project(task, project_dir)
+            if analysis:
+                task = (
+                    "{}\n\n"
+                    "---\n\n"
+                    "## 프로젝트 코드베이스 분석 결과\n\n"
+                    "{}"
+                ).format(task, analysis)
+
+        # 작업 저장 (분석 결과 포함)
         task_path = self.run_dir / "task.md"
         task_path.write_text(task, encoding="utf-8")
+
+        # 시간 측정 시작
+        start_time = time.time()
 
         # Step 1: 초기 population
         population = self.generate_initial_population(task)
@@ -402,6 +485,12 @@ class RSA:
         final_path.write_text(final_result, encoding="utf-8")
         self.log(f"\n최종 결과 저장: {final_path}")
 
+        # 시간 측정 종료
+        elapsed = time.time() - start_time
+        elapsed_min = int(elapsed // 60)
+        elapsed_sec = int(elapsed % 60)
+        self.elapsed_str = f"{elapsed_min}분 {elapsed_sec}초"
+
         # 실행 요약
         summary = self._generate_summary(task, population, final_result)
         summary_path = self.run_dir / "SUMMARY.md"
@@ -409,6 +498,7 @@ class RSA:
 
         self.log(f"\n{'#'*60}")
         self.log(f"RSA 완료! 결과: {self.run_dir}")
+        self.log(f"  소요 시간: {self.elapsed_str}")
         self.log(f"{'#'*60}\n")
 
         return final_result
@@ -429,7 +519,7 @@ class RSA:
 - **최종 선택:** {self.config.get('final_mode', 'random')}
 - **CLI 경로:** {self.claude_path}
 - **실행 시간:** {self.run_id}
-- **총 비용:** ${self.total_cost_usd:.4f}
+- **소요 시간:** {getattr(self, 'elapsed_str', 'N/A')}
 
 ## 작업
 {task[:500]}{'...' if len(task) > 500 else ''}
@@ -505,8 +595,8 @@ def main():
     parser.add_argument("-N", type=int, default=4, help="Population size (기본: 4)")
     parser.add_argument("-K", type=int, default=3, help="Aggregation subset size (기본: 3)")
     parser.add_argument("-T", type=int, default=3, help="Recursive rounds (기본: 3)")
-    parser.add_argument("--max-workers", "-W", type=int, default=2,
-                        help="병렬 실행 워커 수 (기본: 2)")
+    parser.add_argument("--max-workers", "-W", type=int, default=4,
+                        help="병렬 실행 워커 수 (기본: 4)")
 
     # 최종 선택 모드
     parser.add_argument("--final-mode", type=str, default=None,
@@ -518,6 +608,10 @@ def main():
                         help="생성 모델 (alias: opus, sonnet, haiku)")
     parser.add_argument("--agg-model", type=str, default=None,
                         help="종합 모델 (기본: 생성 모델과 동일)")
+
+    # 프로젝트 분석
+    parser.add_argument("--project-dir", "-P", type=str, default=None,
+                        help="사전 분석할 프로젝트 디렉토리 경로")
 
     # Claude Code CLI 설정
     parser.add_argument("--claude-path", type=str, default=None,
@@ -542,7 +636,7 @@ def main():
         config["K"] = args.K
     if args.T != 3 or "T" not in config:
         config["T"] = args.T
-    if args.max_workers != 2 or "max_workers" not in config:
+    if args.max_workers != 4 or "max_workers" not in config:
         config["max_workers"] = args.max_workers
     if args.final_mode:
         config["final_mode"] = args.final_mode
@@ -554,6 +648,8 @@ def main():
         config["claude_path"] = args.claude_path
     if args.max_budget_usd is not None:
         config["max_budget_usd"] = args.max_budget_usd
+    if args.project_dir:
+        config["project_dir"] = args.project_dir
 
     config["output_dir"] = args.output
     config["verbose"] = not args.quiet

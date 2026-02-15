@@ -227,9 +227,9 @@ class RSA:
     def call_llm_batch(
         self, prompts: List[str], model: Optional[str] = None
     ) -> List[str]:
-        """여러 프롬프트를 병렬 실행 (ThreadPoolExecutor)"""
+        """여러 프롬프트를 병렬 실행 (ThreadPoolExecutor), 짧은 응답 자동 재시도"""
         n = len(prompts)
-        max_workers = self.config.get("max_workers", 2)
+        max_workers = self.config.get("max_workers", 4)
         self.log("  병렬 실행: {}개 (workers={})".format(n, max_workers))
 
         results = [None] * n
@@ -246,6 +246,25 @@ class RSA:
                 preview_lines = text.strip().splitlines()[:3]
                 preview = "\n".join("    │ " + l for l in preview_lines)
                 self.log("  [{}/{}] 완료\n{}".format(idx + 1, n, preview))
+
+        # 짧은 응답 감지 및 재시도
+        if n >= 2:
+            lengths = [len(r) for r in results]
+            median_len = sorted(lengths)[n // 2]
+            threshold = median_len * 0.2  # 중간값의 20% 미만이면 비정상
+
+            for i, r in enumerate(results):
+                if len(r) < threshold and median_len > 1000:
+                    self.log("  [{}] 응답 너무 짧음 ({}자 < 기준 {}자), 재시도...".format(
+                        i + 1, len(r), int(threshold)))
+                    retry = self.call_llm(prompts[i], model)
+                    if len(retry) > len(r):
+                        results[i] = retry
+                        self.log("  [{}] 재시도 성공 ({}자)".format(
+                            i + 1, len(retry)))
+                    else:
+                        self.log("  [{}] 재시도도 짧음 ({}자), 원본 유지".format(
+                            i + 1, len(retry)))
 
         return results
 

@@ -19,6 +19,8 @@ import argparse
 import time
 import subprocess
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 from datetime import datetime
@@ -30,7 +32,7 @@ from datetime import datetime
 
 DEFAULT_CONFIG = {
     # RSA 핵심 파라미터
-    "N": 5,           # Population size (초기 생성 수)
+    "N": 4,           # Population size (초기 생성 수)
     "K": 3,           # Aggregation subset size (한번에 묶을 수)
     "T": 3,           # Recursive steps (라운드 수)
     "final_mode": "random",  # 최종 선택: "random" (논문) 또는 "aggregate"
@@ -44,6 +46,7 @@ DEFAULT_CONFIG = {
     "max_budget_usd": None,       # 최대 비용 제한 (None=무제한)
     "disable_tools": True,        # 도구 비활성화 (계획/분석만 생성)
     "timeout": 1800,              # CLI 호출 타임아웃 (초, 30분)
+    "max_workers": 2,             # 병렬 실행 워커 수
 
     # 출력 설정
     "output_dir": "./rsa_output",
@@ -118,6 +121,7 @@ class RSA:
 
         # 비용 추적
         self.total_cost_usd = 0.0
+        self._cost_lock = threading.Lock()
 
         self.output_dir = Path(self.config["output_dir"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -170,9 +174,11 @@ class RSA:
             raise RuntimeError(
                 "CLI 응답 오류: {}".format(response.get("result", "unknown")))
         cost = response.get("cost_usd") or response.get("total_cost_usd", 0)
-        self.total_cost_usd += cost
+        with self._cost_lock:
+            self.total_cost_usd += cost
+            cumulative = self.total_cost_usd
         self.log("    비용: ${:.4f} (누적: ${:.4f})".format(
-            cost, self.total_cost_usd))
+            cost, cumulative))
         return response["result"]
 
     def call_llm(self, prompt: str, model: Optional[str] = None) -> str:
@@ -224,18 +230,25 @@ class RSA:
     def call_llm_batch(
         self, prompts: List[str], model: Optional[str] = None
     ) -> List[str]:
-        """여러 프롬프트를 순차 실행 (권한 충돌 방지)"""
+        """여러 프롬프트를 병렬 실행 (ThreadPoolExecutor)"""
         n = len(prompts)
-        self.log("  순차 실행 시작: {}개".format(n))
+        max_workers = self.config.get("max_workers", 2)
+        self.log("  병렬 실행: {}개 (workers={})".format(n, max_workers))
 
-        results = []
-        for i, prompt in enumerate(prompts):
-            self.log("  [{}/{}] 실행 중...".format(i + 1, n))
-            text = self.call_llm(prompt, model)
-            preview_lines = text.strip().splitlines()[:3]
-            preview = "\n".join("    │ " + l for l in preview_lines)
-            self.log("  [{}/{}] 완료\n{}".format(i + 1, n, preview))
-            results.append(text)
+        results = [None] * n
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self.call_llm, p, model): i
+                for i, p in enumerate(prompts)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                text = future.result()
+                results[idx] = text
+                preview_lines = text.strip().splitlines()[:3]
+                preview = "\n".join("    │ " + l for l in preview_lines)
+                self.log("  [{}/{}] 완료\n{}".format(idx + 1, n, preview))
 
         return results
 
@@ -255,10 +268,10 @@ class RSA:
 
     # ----- Step 1: 초기 Population 생성 -----
     def generate_initial_population(self, task: str) -> List[str]:
-        """N개의 독립적인 초기 솔루션 순차 생성"""
+        """N개의 독립적인 초기 솔루션 병렬 생성"""
         N = self.config["N"]
         self.log("\n{}".format("=" * 60))
-        self.log("Step 1: 초기 population 순차 생성 (N={})".format(N))
+        self.log("Step 1: 초기 population 병렬 생성 (N={})".format(N))
         self.log("{}".format("=" * 60))
 
         prompts = []
@@ -324,7 +337,8 @@ class RSA:
 
         self.log(f"\n{'#'*60}")
         self.log(f"RSA 실행 시작")
-        self.log(f"  N={N} (population), K={K} (subset), T={T} (rounds)")
+        W = self.config.get("max_workers", 2)
+        self.log(f"  N={N} (population), K={K} (subset), T={T} (rounds), workers={W}")
         self.log(f"  모델: {self.config['model']}")
         self.log(f"  종합 모델: {self.config['aggregation_model']}")
         self.log(f"  출력: {self.run_dir}")
@@ -411,6 +425,7 @@ class RSA:
 - **Rounds (T):** {self.config['T']}
 - **모델:** {self.config['model']}
 - **종합 모델:** {self.config['aggregation_model']}
+- **병렬 워커:** {self.config.get('max_workers', 2)}
 - **최종 선택:** {self.config.get('final_mode', 'random')}
 - **CLI 경로:** {self.claude_path}
 - **실행 시간:** {self.run_id}
@@ -487,9 +502,11 @@ def main():
     task_group.add_argument("--task-file", "-f", type=str, help="작업 설명 파일 (.md, .txt)")
 
     # RSA 파라미터
-    parser.add_argument("-N", type=int, default=5, help="Population size (기본: 5)")
+    parser.add_argument("-N", type=int, default=4, help="Population size (기본: 4)")
     parser.add_argument("-K", type=int, default=3, help="Aggregation subset size (기본: 3)")
     parser.add_argument("-T", type=int, default=3, help="Recursive rounds (기본: 3)")
+    parser.add_argument("--max-workers", "-W", type=int, default=2,
+                        help="병렬 실행 워커 수 (기본: 2)")
 
     # 최종 선택 모드
     parser.add_argument("--final-mode", type=str, default=None,
@@ -519,12 +536,14 @@ def main():
     config = load_config(args.config)
 
     # CLI 인자가 설정 파일보다 우선
-    if args.N != 5 or "N" not in config:
+    if args.N != 4 or "N" not in config:
         config["N"] = args.N
     if args.K != 3 or "K" not in config:
         config["K"] = args.K
     if args.T != 3 or "T" not in config:
         config["T"] = args.T
+    if args.max_workers != 2 or "max_workers" not in config:
+        config["max_workers"] = args.max_workers
     if args.final_mode:
         config["final_mode"] = args.final_mode
     if args.model:
